@@ -295,19 +295,18 @@ def section_title(kicker: str, title: str, description: str = "") -> None:
         if description
         else ""
     )
-    st.markdown(
+    st.html(
         f"""
         <div class="section-heading">
           <span>{html.escape(kicker)}</span>
           <div><h2>{html.escape(title)}</h2>{description_html}</div>
         </div>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
 def render_header() -> None:
-    st.markdown(
+    st.html(
         """
         <header class="hero">
           <div>
@@ -317,8 +316,7 @@ def render_header() -> None:
           </div>
           <div class="live-badge"><i></i> LIVE · BASE</div>
         </header>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -372,7 +370,7 @@ def render_kpis(frame: pd.DataFrame) -> None:
         """
         for tone, label, value, detail in cards
     )
-    st.markdown(f'<div class="kpi-grid">{card_html}</div>', unsafe_allow_html=True)
+    st.html(f'<div class="kpi-grid">{card_html}</div>')
 
 
 def top_counts(frame: pd.DataFrame, column: str) -> list[tuple[str, int]]:
@@ -407,7 +405,7 @@ def render_ranking_card(
     else:
         body = '<div class="healthy-state">Sin quiebres en esta selección</div>'
 
-    st.markdown(
+    st.html(
         f"""
         <article class="ranking-card">
           <div class="card-head">
@@ -416,8 +414,7 @@ def render_ranking_card(
           </div>
           <div class="ranking-body">{body}</div>
         </article>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -606,7 +603,7 @@ def render_detail_table(frame: pd.DataFrame) -> None:
         if len(frame) > 100
         else f"Mostrando {len(frame):,}"
     )
-    st.markdown(
+    st.html(
         f"""
         <section class="detail-card">
           <div class="detail-head">
@@ -635,13 +632,12 @@ def render_detail_table(frame: pd.DataFrame) -> None:
             <span>{visible_text} registros</span>
           </div>
         </section>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
 def inject_css() -> None:
-    st.markdown(
+    st.html(
         f"""
         <style>
           :root {{
@@ -650,7 +646,11 @@ def inject_css() -> None:
           }}
 
           .stApp {{
-            background:var(--paper);
+            background-color:var(--paper);
+            background-image:
+              linear-gradient(rgba(23,23,23,.045) 1px, transparent 1px),
+              linear-gradient(90deg, rgba(23,23,23,.045) 1px, transparent 1px);
+            background-size:28px 28px;
             color:var(--ink);
           }}
           .block-container {{
@@ -1099,8 +1099,7 @@ def inject_css() -> None:
             .table-footer {{ flex-direction:column; }}
           }}
         </style>
-        """,
-        unsafe_allow_html=True,
+        """
     )
 
 
@@ -1192,9 +1191,8 @@ def main() -> None:
             top_counts(filtered, "PRODUCT_NAME"),
         )
     with status_col, st.container(key="status_card"):
-        st.markdown(
-            '<div class="card-head"><h3>Composición del estatus</h3><span>Mix</span></div>',
-            unsafe_allow_html=True,
+        st.html(
+            '<div class="card-head"><h3>Composición del estatus</h3><span>Mix</span></div>'
         )
         st.plotly_chart(
             status_figure(filtered),
@@ -1209,14 +1207,13 @@ def main() -> None:
     )
     network_figure, network_note = store_figure(filtered, city)
     with st.container(key="network_card"):
-        st.markdown(
+        st.html(
             f"""
             <div class="network-head">
               <h3>Rendimiento de tiendas</h3>
               <span>{html.escape(network_note)}</span>
             </div>
-            """,
-            unsafe_allow_html=True,
+            """
         )
         if network_figure is None:
             st.info("Sin tiendas para mostrar con los filtros actuales.")
