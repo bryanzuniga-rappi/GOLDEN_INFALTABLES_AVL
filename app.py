@@ -5,6 +5,7 @@ import html
 import io
 import math
 import re
+import unicodedata
 from datetime import datetime, timezone
 from itertools import islice
 
@@ -77,6 +78,17 @@ DISPLAY_COLUMNS = [
     "IGA",
 ]
 
+FLAGSHIP_STORES = (
+    "Ángel de Independencia",
+    "Carso",
+    "Manitoba",
+    "Narvarte",
+    "Parque Lira",
+    "Patriotismo",
+    "Polanco",
+    "Toriello Guerra",
+)
+
 
 # ---------------------------------------------------------------------------
 # Paleta: brutalismo moderno, sobrio y legible
@@ -95,6 +107,16 @@ GREEN = "#179A63"
 def normalize_header(value: object) -> str:
     text = str(value or "").lstrip("\ufeff")
     return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_key(value: object) -> str:
+    """Normaliza mayúsculas, acentos y espacios para comparaciones de catálogo."""
+    text = unicodedata.normalize("NFKD", str(value or ""))
+    text = "".join(character for character in text if not unicodedata.combining(character))
+    return re.sub(r"\s+", " ", text).strip().casefold()
+
+
+FLAGSHIP_STORE_KEYS = frozenset(normalize_key(store) for store in FLAGSHIP_STORES)
 
 
 def detect_header_row(csv_text: str) -> int:
@@ -269,12 +291,20 @@ def apply_filters(
     frame: pd.DataFrame,
     search: str,
     city: str,
+    flagship: str,
     store: str,
     segment: str,
 ) -> pd.DataFrame:
     mask = pd.Series(True, index=frame.index)
     if city != "Todas":
         mask &= text_series(frame, "CITY").eq(city)
+    flagship_rows = text_series(frame, "WAREHOUSE_NAME").map(normalize_key).isin(
+        FLAGSHIP_STORE_KEYS
+    )
+    if flagship == "Solo Flagship":
+        mask &= flagship_rows
+    elif flagship == "Excluir Flagship":
+        mask &= ~flagship_rows
     if store != "Todas":
         mask &= text_series(frame, "WAREHOUSE_NAME").eq(store)
     if segment != "Todos":
@@ -1133,8 +1163,8 @@ def main() -> None:
         "Los indicadores y visualizaciones responden a esta selección.",
     )
     with st.container(key="filter_panel"):
-        search_col, city_col, store_col, segment_col = st.columns(
-            [1.8, 1, 1.2, 1]
+        search_col, city_col, flagship_col, store_col, segment_col = st.columns(
+            [1.7, 1, 1, 1.2, 1]
         )
         with search_col:
             search = st.text_input(
@@ -1147,11 +1177,24 @@ def main() -> None:
                 ["Todas", *unique_options(raw_data, "CITY")],
             )
 
+        with flagship_col:
+            flagship = st.selectbox(
+                "Flagship stores",
+                ["Todas", "Solo Flagship", "Excluir Flagship"],
+            )
+
         store_source = (
             raw_data
             if city == "Todas"
             else raw_data.loc[text_series(raw_data, "CITY").eq(city)]
         )
+        store_source_flagship = text_series(
+            store_source, "WAREHOUSE_NAME"
+        ).map(normalize_key).isin(FLAGSHIP_STORE_KEYS)
+        if flagship == "Solo Flagship":
+            store_source = store_source.loc[store_source_flagship]
+        elif flagship == "Excluir Flagship":
+            store_source = store_source.loc[~store_source_flagship]
         with store_col:
             store = st.selectbox(
                 "Tienda / Warehouse",
@@ -1163,7 +1206,7 @@ def main() -> None:
                 ["Todos", *unique_options(raw_data, "IGA")],
             )
 
-    filtered = apply_filters(raw_data, search, city, store, segment)
+    filtered = apply_filters(raw_data, search, city, flagship, store, segment)
 
     section_title(
         "RESUMEN",
