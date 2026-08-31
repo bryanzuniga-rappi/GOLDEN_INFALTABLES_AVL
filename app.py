@@ -1,13 +1,12 @@
 from __future__ import annotations
 
+import csv
 import html
 import io
 import math
-import os
 import re
 from datetime import datetime, timezone
-from typing import Iterable
-from urllib.parse import quote
+from itertools import islice
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -16,262 +15,253 @@ import streamlit as st
 
 
 st.set_page_config(
-    page_title="Supply Command Center",
+    page_title="Golden & Infaltables | Command Center",
     page_icon="📦",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
 
-INK = "#0b0b0b"
-PAPER = "#f2efe7"
-WHITE = "#fffdf7"
-RED = "#ff3b30"
-ACID = "#dfff00"
-BLUE = "#246bfe"
-GREEN = "#00a854"
-MUTED = "#55534e"
+# ---------------------------------------------------------------------------
+# Fuente de datos: Google Sheet público
+# ---------------------------------------------------------------------------
+SPREADSHEET_ID = "1OwvE6mwc2G8yrFoBpP0oO_DePw88eiBrlsQoXCP-SS8"
+SHEET_NAME = "BASE"
+SHEET_GID = "2089074760"
+HEADER_ROW = 2
+CACHE_TTL_SECONDS = 300
 
-REQUIRED_COLUMNS = {
-    "PRODUCT_ID",
-    "PRODUCT_NAME",
-    "WAREHOUSE_NAME",
-    "CITY",
-    "IGA",
-    "STOCK TIENDA",
-    "INCOMING",
-    "AVL",
-    "STATUS ACTUAL",
+GVIZ_URL = f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/gviz/tq"
+EXPORT_URL = (
+    f"https://docs.google.com/spreadsheets/d/{SPREADSHEET_ID}/export"
+    f"?format=csv&gid={SHEET_GID}"
+)
+
+# Solamente descarga las columnas que utiliza el dashboard.
+GVIZ_PARAMS = {
+    "tqx": "out:csv",
+    "sheet": SHEET_NAME,
+    "range": "A2:AJ",
+    "headers": "1",
+    "tq": "select B,D,E,G,H,L,R,S,T,U,V,W,X,Z,AA,AI",
 }
 
+CORE_COLUMNS = {
+    "CITY",
+    "WAREHOUSE_NAME",
+    "PRODUCT_ID",
+    "PRODUCT_NAME",
+    "AVL",
+    "STOCK TIENDA",
+    "INCOMING",
+    "STATUS ACTUAL",
+    "IGA",
+}
 
-def get_setting(name: str, default: str = "") -> str:
-    """Read a setting from Streamlit secrets or an environment variable."""
-    try:
-        value = st.secrets.get(name, "")
-        if value not in (None, ""):
-            return str(value)
-    except Exception:
-        pass
-    return str(os.getenv(name, default))
+DISPLAY_COLUMNS = [
+    "CITY",
+    "WAREHOUSE_NAME",
+    "PRODUCT_ID",
+    "PRODUCT_NAME",
+    "STORAGE_TYPE",
+    "AVL",
+    "STOCK TIENDA",
+    "INCOMING",
+    "444",
+    "831",
+    "811",
+    "834",
+    "STATUS ACTUAL",
+    "COMMENT",
+    "COMMENT 2",
+    "IGA",
+]
 
 
-def get_int_setting(name: str, default: int) -> int:
-    try:
-        return int(get_setting(name, str(default)))
-    except (TypeError, ValueError):
-        return default
+# ---------------------------------------------------------------------------
+# Paleta: brutalismo moderno, sobrio y legible
+# ---------------------------------------------------------------------------
+INK = "#171717"
+PAPER = "#F3F1EB"
+WHITE = "#FFFFFF"
+SOFT = "#E7E4DC"
+MUTED = "#66645F"
+ACID = "#DDF64C"
+RED = "#FF5A4F"
+BLUE = "#4B68E8"
+GREEN = "#179A63"
 
 
 def normalize_header(value: object) -> str:
-    return re.sub(r"\s+", " ", str(value or "")).strip()
+    text = str(value or "").lstrip("\ufeff")
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def sheet_to_csv_url(sheet_reference: str, sheet_name: str) -> str:
-    """Accept a Google Sheets URL, file ID, or an already-built CSV URL."""
-    reference = sheet_reference.strip()
-    if not reference:
-        raise ValueError("Falta configurar SHEET_URL.")
-
-    lower = reference.lower()
-    if "output=csv" in lower or "tqx=out:csv" in lower:
-        return reference
-
-    match = re.search(r"/spreadsheets/d/([a-zA-Z0-9_-]+)", reference)
-    sheet_id = match.group(1) if match else reference
-
-    if not re.fullmatch(r"[a-zA-Z0-9_-]{20,}", sheet_id):
-        raise ValueError(
-            "La URL no parece corresponder a un Google Sheet. "
-            "Pega la URL completa, el ID del archivo o una URL CSV pública."
-        )
-
-    return (
-        f"https://docs.google.com/spreadsheets/d/{sheet_id}/gviz/tq"
-        f"?tqx=out:csv&sheet={quote(sheet_name)}"
+def detect_header_row(csv_text: str) -> int:
+    """Detecta la fila de cabeceras aunque Google omita o conserve la fila 1."""
+    reader = csv.reader(io.StringIO(csv_text))
+    for index, row in enumerate(islice(reader, 10)):
+        normalized = {normalize_header(cell) for cell in row}
+        if CORE_COLUMNS.issubset(normalized):
+            return index
+    raise ValueError(
+        "No se localizaron las cabeceras esperadas de BASE en las primeras 10 filas."
     )
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def load_sheet(
-    sheet_reference: str,
-    sheet_name: str,
-    header_row: int,
-    max_rows: int,
-) -> tuple[pd.DataFrame, dict[str, object]]:
-    csv_url = sheet_to_csv_url(sheet_reference, sheet_name)
-    response = requests.get(
-        csv_url,
-        timeout=35,
-        headers={"User-Agent": "Mozilla/5.0 SupplyCommandCenter/1.0"},
-    )
-    response.raise_for_status()
-
-    body = response.text.lstrip()
-    if body.lower().startswith("<!doctype html") or body.lower().startswith("<html"):
+def parse_sheet_csv(csv_text: str) -> pd.DataFrame:
+    if csv_text.lstrip().lower().startswith(("<!doctype html", "<html")):
         raise PermissionError(
-            "Google devolvió una página web en lugar del CSV. "
-            "Verifica que el Sheet sea público para lectura y que exista la pestaña indicada."
+            "Google devolvió una página de acceso en lugar del archivo CSV."
         )
 
-    try:
-        frame = pd.read_csv(
-            io.StringIO(response.text),
-            header=max(header_row - 1, 0),
-            dtype=str,
-            keep_default_na=False,
-            nrows=max_rows + 1,
-        )
-    except pd.errors.EmptyDataError as exc:
-        raise ValueError("La pestaña no contiene datos legibles.") from exc
-
+    header_index = detect_header_row(csv_text)
+    frame = pd.read_csv(
+        io.StringIO(csv_text),
+        header=header_index,
+        dtype=str,
+        keep_default_na=False,
+        low_memory=False,
+    )
     frame.columns = [normalize_header(column) for column in frame.columns]
     frame = frame.loc[:, ~frame.columns.duplicated()].copy()
-    frame = frame.replace(r"^\s*$", pd.NA, regex=True).dropna(how="all").fillna("")
 
-    missing = sorted(REQUIRED_COLUMNS.difference(frame.columns))
+    missing = sorted(CORE_COLUMNS.difference(frame.columns))
     if missing:
-        raise ValueError(
-            f"Faltan encabezados en la fila {header_row}: {', '.join(missing)}"
-        )
+        raise ValueError(f"Faltan columnas obligatorias: {', '.join(missing)}")
 
-    truncated = len(frame) > max_rows
-    if truncated:
-        frame = frame.iloc[:max_rows].copy()
+    for column in DISPLAY_COLUMNS:
+        if column not in frame.columns:
+            frame[column] = ""
 
-    metadata = {
-        "rows": len(frame),
-        "truncated": truncated,
-        "max_rows": max_rows,
-        "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "sheet_name": sheet_name,
-    }
-    return frame, metadata
+    frame = frame[DISPLAY_COLUMNS].copy()
+    frame = frame.replace(r"^\s*$", pd.NA, regex=True)
+    frame = frame.dropna(
+        how="all",
+        subset=["PRODUCT_ID", "PRODUCT_NAME", "WAREHOUSE_NAME"],
+    ).fillna("")
+    return frame.reset_index(drop=True)
 
 
-def series_as_text(frame: pd.DataFrame, column: str, fallback: str = "") -> pd.Series:
+@st.cache_data(ttl=CACHE_TTL_SECONDS, show_spinner=False)
+def load_data() -> tuple[pd.DataFrame, dict[str, object]]:
+    """Carga la hoja pública; usa un endpoint alterno si Google rechaza GViz."""
+    attempts = [
+        (GVIZ_URL, GVIZ_PARAMS),
+        (EXPORT_URL, None),
+    ]
+    errors: list[str] = []
+
+    for url, params in attempts:
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=120,
+                headers={"User-Agent": "Mozilla/5.0 SupplyCommandCenter/2.0"},
+            )
+            response.raise_for_status()
+            text = response.content.decode("utf-8-sig")
+            frame = parse_sheet_csv(text)
+            return frame, {
+                "rows": len(frame),
+                "loaded_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                "sheet": SHEET_NAME,
+            }
+        except Exception as exc:
+            errors.append(str(exc))
+
+    detail = errors[-1] if errors else "Error desconocido"
+    raise RuntimeError(
+        "No fue posible leer el Google Sheet público. "
+        f"Último detalle recibido: {detail}"
+    )
+
+
+def text_series(frame: pd.DataFrame, column: str, fallback: str = "") -> pd.Series:
     if column not in frame.columns:
         return pd.Series(fallback, index=frame.index, dtype="object")
     return frame[column].fillna("").astype(str).str.strip()
 
 
-def series_as_number(frame: pd.DataFrame, column: str) -> pd.Series:
-    values = series_as_text(frame, column)
-    values = values.str.replace(",", "", regex=False).str.replace("%", "", regex=False)
+def number_series(frame: pd.DataFrame, column: str) -> pd.Series:
+    values = (
+        text_series(frame, column)
+        .str.replace(",", "", regex=False)
+        .str.replace("%", "", regex=False)
+    )
     return pd.to_numeric(values, errors="coerce").fillna(0.0)
 
 
-def scalar_as_number(value: object) -> float:
+def scalar_number(value: object) -> float:
     try:
-        parsed = float(str(value).replace(",", "").replace("%", "").strip())
-        return parsed if math.isfinite(parsed) else 0.0
+        number = float(str(value).replace(",", "").replace("%", "").strip())
+        return number if math.isfinite(number) else 0.0
     except (TypeError, ValueError):
         return 0.0
 
 
 def format_number(value: object) -> str:
-    number = scalar_as_number(value)
+    number = scalar_number(value)
     if number.is_integer():
         return f"{int(number):,}"
     return f"{number:,.2f}".rstrip("0").rstrip(".")
 
 
-def status_clean(values: pd.Series) -> pd.Series:
-    cleaned = values.replace("", "SIN STATUS").str.replace(
-        r"^[0-9]+\.\s*", "", regex=True
-    ).str.strip()
+def clean_status(values: pd.Series) -> pd.Series:
+    cleaned = (
+        values.replace("", "SIN STATUS")
+        .str.replace(r"^[0-9]+\.\s*", "", regex=True)
+        .str.strip()
+    )
     return cleaned.replace("", "SIN STATUS")
 
 
-def is_healthy(frame: pd.DataFrame) -> pd.Series:
-    broken = (series_as_number(frame, "STOCK TIENDA") <= 0) & (
-        series_as_number(frame, "INCOMING") <= 0
+def broken_mask(frame: pd.DataFrame) -> pd.Series:
+    return (number_series(frame, "STOCK TIENDA") <= 0) & (
+        number_series(frame, "INCOMING") <= 0
     )
-    return (series_as_number(frame, "AVL") > 0) | ~broken
 
 
-def is_broken(frame: pd.DataFrame) -> pd.Series:
-    return (series_as_number(frame, "STOCK TIENDA") <= 0) & (
-        series_as_number(frame, "INCOMING") <= 0
-    )
+def healthy_mask(frame: pd.DataFrame) -> pd.Series:
+    return (number_series(frame, "AVL") > 0) | ~broken_mask(frame)
+
+
+def critical_mask(frame: pd.DataFrame) -> pd.Series:
+    comments = text_series(frame, "COMMENT")
+    statuses = text_series(frame, "STATUS ACTUAL")
+    return comments.str.contains(
+        r"CR[IÍ]TICO", case=False, regex=True
+    ) | statuses.str.contains("LINKS", case=False, regex=False)
+
+
+def status_tone(status: str) -> str:
+    upper = status.upper()
+    if any(term in upper for term in ("LINKS", "0 STOCK", "INSUFICIENTE")):
+        return "red"
+    if any(term in upper for term in ("OPORTUNIDAD", "ORIGEN")):
+        return "blue"
+    if any(term in upper for term in ("CON STOCK", "SANO", "CUBIERTO")):
+        return "green"
+    return "gray"
 
 
 def status_color(status: str) -> str:
-    upper = status.upper()
-    if any(term in upper for term in ("LINKS", "0 STOCK", "INSUFICIENTE")):
-        return RED
-    if any(term in upper for term in ("OPORTUNIDAD", "ORIGEN")):
-        return BLUE
-    return ACID
+    return {
+        "red": RED,
+        "blue": BLUE,
+        "green": GREEN,
+        "gray": "#A8A59E",
+    }[status_tone(status)]
 
 
-def escaped(value: object, fallback: str = "S/N") -> str:
-    text = str(value).strip() if value not in (None, "") else fallback
-    return html.escape(text)
-
-
-def section_kicker(index: str, label: str) -> None:
-    st.markdown(
-        f'<div class="section-kicker"><span>{index}</span>{html.escape(label)}</div>',
-        unsafe_allow_html=True,
-    )
-
-
-def render_header() -> None:
-    st.markdown(
-        """
-        <div class="masthead">
-          <div class="brand-mark">L+</div>
-          <div class="brand-copy">
-            <h1>Supply Command Center</h1>
-            <span>Live Operations</span>
-          </div>
-          <div class="health"><i></i>Sistema online</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def render_kpis(frame: pd.DataFrame) -> None:
-    broken = is_broken(frame)
-    healthy = is_healthy(frame)
-    status = series_as_text(frame, "STATUS ACTUAL")
-    comments = series_as_text(frame, "COMMENT")
-    critical = comments.str.contains(r"CR[IÍ]TICO", case=False, regex=True) | status.str.contains(
-        "LINKS", case=False, regex=False
-    )
-
-    total = len(frame)
-    nominal = int(healthy.sum())
-    availability = (nominal / total * 100) if total else 0.0
-    stores_with_breaks = int(
-        series_as_text(frame.loc[broken], "WAREHOUSE_NAME", "SIN TIENDA")
-        .replace("", "SIN TIENDA")
-        .nunique()
-    )
-
-    cards = [
-        ("acid", "AVL", "AVL General<br>Disponibilidad", "↗", f"{availability:.1f}%", f"Sanos: {nominal:,} / Total: {total:,}"),
-        ("red", "QBR", "Quiebre físico<br>0 stock + 0 inc", "!", f"{int(broken.sum()):,}", "SKUs totalmente agotados"),
-        ("white", "WH", "Tiendas con<br>quiebres", "⌂", f"{stores_with_breaks:,}", "Almacenes requiriendo atención"),
-        ("blue", "LCK", "Críticos<br>Chedraui Lock", "×", f"{int(critical.sum()):,}", "Requiere intervención de catálogo"),
-    ]
-    card_html = "".join(
-        f"""
-        <article class="kpi-card {color}" data-code="{code}">
-          <div class="eyebrow"><span>{label}</span><b>{symbol}</b></div>
-          <div class="metric">{value}</div>
-          <div class="metric-sub">{subtitle}</div>
-        </article>
-        """
-        for color, code, label, symbol, value, subtitle in cards
-    )
-    st.markdown(f'<div class="bento-grid">{card_html}</div>', unsafe_allow_html=True)
+def escape(value: object, fallback: str = "S/N") -> str:
+    value_text = str(value).strip() if value not in (None, "") else fallback
+    return html.escape(value_text)
 
 
 def unique_options(frame: pd.DataFrame, column: str) -> list[str]:
-    values = [value for value in series_as_text(frame, column).unique().tolist() if value]
+    values = [value for value in text_series(frame, column).unique() if value]
     return sorted(values, key=str.casefold)
 
 
@@ -284,80 +274,175 @@ def apply_filters(
 ) -> pd.DataFrame:
     mask = pd.Series(True, index=frame.index)
     if city != "Todas":
-        mask &= series_as_text(frame, "CITY").eq(city)
+        mask &= text_series(frame, "CITY").eq(city)
     if store != "Todas":
-        mask &= series_as_text(frame, "WAREHOUSE_NAME").eq(store)
+        mask &= text_series(frame, "WAREHOUSE_NAME").eq(store)
     if segment != "Todos":
-        mask &= series_as_text(frame, "IGA").eq(segment)
+        mask &= text_series(frame, "IGA").eq(segment)
     if search.strip():
-        term = re.escape(search.strip())
-        mask &= series_as_text(frame, "PRODUCT_NAME").str.contains(
-            term, case=False, regex=True, na=False
-        ) | series_as_text(frame, "PRODUCT_ID").str.contains(
-            term, case=False, regex=True, na=False
+        term = search.strip()
+        mask &= text_series(frame, "PRODUCT_NAME").str.contains(
+            term, case=False, regex=False, na=False
+        ) | text_series(frame, "PRODUCT_ID").str.contains(
+            term, case=False, regex=False, na=False
         )
     return frame.loc[mask].copy()
 
 
-def top_counts(frame: pd.DataFrame, column: str) -> list[tuple[str, int]]:
-    broken_frame = frame.loc[is_broken(frame)].copy()
-    if broken_frame.empty:
-        return []
-    names = series_as_text(broken_frame, column).replace("", "SIN DATO")
-    counts = names.value_counts().head(5)
-    return [(str(name), int(count)) for name, count in counts.items()]
-
-
-def render_top_table(title: str, badge: str, column_label: str, rows: Iterable[tuple[str, int]]) -> None:
-    rows = list(rows)
-    if rows:
-        body = "".join(
-            f"""
-            <tr>
-              <td title="{escaped(name)}"><span class="rank">{rank:02d}</span>{escaped(name)}</td>
-              <td class="num"><span class="danger-num">{count:,}</span></td>
-            </tr>
-            """
-            for rank, (name, count) in enumerate(rows, start=1)
-        )
-    else:
-        body = '<tr><td colspan="2" class="healthy-network">RED 100% SANA // 00</td></tr>'
-
+def section_title(kicker: str, title: str, description: str = "") -> None:
+    description_html = (
+        f'<p class="section-description">{html.escape(description)}</p>'
+        if description
+        else ""
+    )
     st.markdown(
         f"""
-        <div class="analytics-card">
-          <div class="card-title">{html.escape(title)}<span>{html.escape(badge)}</span></div>
-          <table class="mini-table">
-            <thead><tr><th>{html.escape(column_label)}</th><th class="num">Quiebres</th></tr></thead>
-            <tbody>{body}</tbody>
-          </table>
+        <div class="section-heading">
+          <span>{html.escape(kicker)}</span>
+          <div><h2>{html.escape(title)}</h2>{description_html}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
 
-def donut_figure(frame: pd.DataFrame) -> go.Figure:
-    statuses = status_clean(series_as_text(frame, "STATUS ACTUAL"))
-    counts = statuses.value_counts()
+def render_header() -> None:
+    st.markdown(
+        """
+        <header class="hero">
+          <div>
+            <div class="hero-kicker">Supply operations · Inventory control</div>
+            <h1>Golden &amp; Infaltables</h1>
+            <p>Disponibilidad, quiebres y visibilidad de inventario por tienda.</p>
+          </div>
+          <div class="live-badge"><i></i> LIVE · BASE</div>
+        </header>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_kpis(frame: pd.DataFrame) -> None:
+    broken = broken_mask(frame)
+    healthy = healthy_mask(frame)
+    total = len(frame)
+    nominal = int(healthy.sum())
+    availability = nominal / total * 100 if total else 0.0
+    stores_with_breaks = (
+        text_series(frame.loc[broken], "WAREHOUSE_NAME")
+        .replace("", "SIN TIENDA")
+        .nunique()
+    )
+    critical = int(critical_mask(frame).sum())
+
+    cards = [
+        (
+            "green",
+            "AVL general",
+            f"{availability:.1f}%",
+            f"{nominal:,} sanos de {total:,} registros",
+        ),
+        (
+            "red",
+            "Quiebre físico",
+            f"{int(broken.sum()):,}",
+            "Stock tienda 0 + incoming 0",
+        ),
+        (
+            "blue",
+            "Tiendas con quiebre",
+            f"{int(stores_with_breaks):,}",
+            "Almacenes que requieren atención",
+        ),
+        (
+            "dark",
+            "Críticos / Links",
+            f"{critical:,}",
+            "Intervención de catálogo o links",
+        ),
+    ]
+
+    card_html = "".join(
+        f"""
+        <article class="kpi-card {tone}">
+          <div class="kpi-label">{label}</div>
+          <div class="kpi-value">{value}</div>
+          <div class="kpi-detail">{detail}</div>
+        </article>
+        """
+        for tone, label, value, detail in cards
+    )
+    st.markdown(f'<div class="kpi-grid">{card_html}</div>', unsafe_allow_html=True)
+
+
+def top_counts(frame: pd.DataFrame, column: str) -> list[tuple[str, int]]:
+    broken = frame.loc[broken_mask(frame)]
+    if broken.empty:
+        return []
+    counts = (
+        text_series(broken, column)
+        .replace("", "SIN DATO")
+        .value_counts()
+        .head(5)
+    )
+    return [(str(label), int(value)) for label, value in counts.items()]
+
+
+def render_ranking_card(
+    title: str,
+    badge: str,
+    rows: list[tuple[str, int]],
+) -> None:
+    if rows:
+        body = "".join(
+            f"""
+            <div class="rank-row">
+              <span class="rank-number">{index:02d}</span>
+              <span class="rank-name" title="{escape(name)}">{escape(name)}</span>
+              <strong>{count:,}</strong>
+            </div>
+            """
+            for index, (name, count) in enumerate(rows, start=1)
+        )
+    else:
+        body = '<div class="healthy-state">Sin quiebres en esta selección</div>'
+
+    st.markdown(
+        f"""
+        <article class="ranking-card">
+          <div class="card-head">
+            <h3>{html.escape(title)}</h3>
+            <span>{html.escape(badge)}</span>
+          </div>
+          <div class="ranking-body">{body}</div>
+        </article>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def status_figure(frame: pd.DataFrame) -> go.Figure:
+    counts = clean_status(text_series(frame, "STATUS ACTUAL")).value_counts()
     labels = counts.index.tolist()
     values = counts.values.tolist()
-    colors = [status_color(label) for label in labels]
 
     figure = go.Figure(
         go.Pie(
             labels=labels,
             values=values,
-            hole=0.68,
-            marker={"colors": colors, "line": {"color": INK, "width": 3}},
+            hole=0.62,
             sort=False,
             textinfo="none",
-            hovertemplate="%{label}<br>%{value:,} registros<extra></extra>",
+            marker={
+                "colors": [status_color(label) for label in labels],
+                "line": {"color": WHITE, "width": 2},
+            },
+            hovertemplate="<b>%{label}</b><br>%{value:,} registros · %{percent}<extra></extra>",
         )
     )
     figure.update_layout(
-        height=245,
-        margin={"l": 8, "r": 8, "t": 8, "b": 8},
+        height=300,
+        margin={"l": 8, "r": 8, "t": 14, "b": 8},
         paper_bgcolor=WHITE,
         plot_bgcolor=WHITE,
         showlegend=False,
@@ -367,148 +452,187 @@ def donut_figure(frame: pd.DataFrame) -> go.Figure:
                 "x": 0.5,
                 "y": 0.5,
                 "showarrow": False,
-                "font": {"size": 22, "color": INK, "family": "Arial Black"},
+                "font": {"size": 21, "color": INK, "family": "Arial"},
             }
         ],
     )
     return figure
 
 
-def store_availability_figure(frame: pd.DataFrame, selected_city: str) -> go.Figure | None:
+def store_figure(
+    frame: pd.DataFrame,
+    selected_city: str,
+    limit: int = 30,
+) -> tuple[go.Figure | None, str]:
     if frame.empty:
-        return None
+        return None, "Sin tiendas para mostrar"
 
     working = pd.DataFrame(
         {
-            "store": series_as_text(frame, "WAREHOUSE_NAME").replace("", "SIN TIENDA"),
-            "city": series_as_text(frame, "CITY"),
-            "healthy": is_healthy(frame).astype(int),
+            "store": text_series(frame, "WAREHOUSE_NAME").replace("", "SIN TIENDA"),
+            "city": text_series(frame, "CITY"),
+            "healthy": healthy_mask(frame).astype(int),
         },
         index=frame.index,
     )
     grouped = (
         working.groupby("store", as_index=False)
-        .agg(city=("city", "first"), nominal=("healthy", "sum"), target=("healthy", "size"))
+        .agg(
+            city=("city", "first"),
+            nominal=("healthy", "sum"),
+            target=("healthy", "size"),
+        )
     )
     grouped["avl"] = grouped["nominal"] / grouped["target"] * 100
     grouped["label"] = grouped.apply(
         lambda row: (
-            f"{row['store']} [{row['city']}]"
+            f"{row['store']} · {row['city']}"
             if selected_city == "Todas" and row["city"]
             else row["store"]
         ),
         axis=1,
     )
-    grouped = grouped.sort_values(["avl", "label"], ascending=[True, True])
-    colors = [GREEN if value >= 90 else BLUE if value >= 75 else RED for value in grouped["avl"]]
+
+    total_stores = len(grouped)
+    visible = grouped.nsmallest(limit, "avl").sort_values(
+        ["avl", "label"], ascending=[False, True]
+    )
+    colors = [
+        GREEN if value >= 90 else BLUE if value >= 75 else RED
+        for value in visible["avl"]
+    ]
 
     figure = go.Figure(
         go.Bar(
-            x=grouped["avl"],
-            y=grouped["label"],
+            x=visible["avl"],
+            y=visible["label"],
             orientation="h",
-            marker={"color": colors, "line": {"color": INK, "width": 1.5}},
-            customdata=grouped[["nominal", "target"]],
+            marker={"color": colors, "line": {"color": INK, "width": 1}},
+            customdata=visible[["nominal", "target"]],
             hovertemplate=(
-                "%{y}<br>AVL: %{x:.1f}%<br>Sanos: %{customdata[0]:,} / "
-                "%{customdata[1]:,}<extra></extra>"
+                "<b>%{y}</b><br>AVL: %{x:.1f}%<br>"
+                "Sanos: %{customdata[0]:,} / %{customdata[1]:,}<extra></extra>"
             ),
         )
     )
     figure.update_layout(
-        height=max(360, min(1050, 30 * len(grouped) + 90)),
-        margin={"l": 12, "r": 18, "t": 15, "b": 35},
+        height=max(390, min(850, len(visible) * 26 + 90)),
+        margin={"l": 10, "r": 20, "t": 18, "b": 40},
         paper_bgcolor=WHITE,
         plot_bgcolor=WHITE,
         showlegend=False,
         bargap=0.28,
-        font={"family": "Arial", "color": INK},
+        font={"family": "Arial", "color": INK, "size": 12},
         xaxis={
             "title": "AVL %",
             "range": [0, 100],
             "ticksuffix": "%",
-            "gridcolor": "rgba(11,11,11,.12)",
+            "gridcolor": "#E8E5DE",
             "zeroline": False,
         },
         yaxis={"title": "", "automargin": True, "gridcolor": "rgba(0,0,0,0)"},
     )
-    return figure
+    note = (
+        f"Mostrando las {len(visible)} tiendas con menor AVL de {total_stores:,}"
+        if total_stores > limit
+        else f"{total_stores:,} tiendas en la selección"
+    )
+    return figure, note
 
 
-def cedis_pill(label: str, value: object) -> str:
-    number = scalar_as_number(value)
-    empty_class = " empty" if number <= 0 else ""
+def cedis_cell(label: str, value: object) -> str:
+    number = scalar_number(value)
+    tone = "positive" if number > 0 else "empty"
     return (
-        f'<div class="cedis-pill{empty_class}">{label}<br>'
-        f'<span>{format_number(number)}</span></div>'
+        f'<div class="cedis-cell {tone}"><small>{label}</small>'
+        f"<strong>{format_number(number)}</strong></div>"
     )
 
 
 def render_detail_table(frame: pd.DataFrame) -> None:
     if frame.empty:
-        body = '<tr><td colspan="5" class="empty-state">Sin datos para mostrar // Ajusta los filtros</td></tr>'
+        rows_html = (
+            '<tr><td colspan="5" class="empty-table">'
+            "Sin registros para los filtros seleccionados</td></tr>"
+        )
     else:
         rows: list[str] = []
         for _, row in frame.head(100).iterrows():
-            status = re.sub(r"^[0-9]+\.\s*", "", str(row.get("STATUS ACTUAL", "SIN STATUS"))).strip() or "SIN STATUS"
-            color = status_color(status)
-            tag_class = "tag-red" if color == RED else "tag-blue" if color == BLUE else "tag-gray"
-            physical = format_number(row.get("STOCK TIENDA", 0))
-            incoming = format_number(row.get("INCOMING", 0))
+            status = re.sub(
+                r"^[0-9]+\.\s*",
+                "",
+                str(row.get("STATUS ACTUAL", "SIN STATUS")),
+            ).strip() or "SIN STATUS"
+            comment = str(row.get("COMMENT", "")).strip()
+            comment_html = (
+                f'<div class="table-muted">{escape(comment)}</div>'
+                if comment
+                else ""
+            )
             rows.append(
                 f"""
                 <tr>
                   <td>
-                    <div class="product-name">{escaped(row.get('PRODUCT_NAME'))}</div>
-                    <div class="micro-copy">{escaped(row.get('PRODUCT_ID'))} // {escaped(row.get('IGA'))}</div>
+                    <div class="table-primary">{escape(row.get("PRODUCT_NAME"))}</div>
+                    <div class="table-muted">{escape(row.get("PRODUCT_ID"))} · {escape(row.get("IGA"))}</div>
                   </td>
                   <td>
-                    <div class="product-name">{escaped(row.get('WAREHOUSE_NAME'))}</div>
-                    <div class="micro-copy">{escaped(row.get('CITY'))}</div>
+                    <div class="table-primary">{escape(row.get("WAREHOUSE_NAME"))}</div>
+                    <div class="table-muted">{escape(row.get("CITY"))}</div>
                   </td>
                   <td>
-                    <div class="stock-main">{physical} Físico</div>
-                    <div class="micro-copy">+{incoming} Incoming</div>
+                    <div class="inventory-line"><strong>{format_number(row.get("STOCK TIENDA", 0))}</strong> físico</div>
+                    <div class="table-muted">+{format_number(row.get("INCOMING", 0))} incoming</div>
                   </td>
-                  <td><span class="status-tag {tag_class}">{escaped(status)}</span></td>
-                  <td><div class="cedis-grid">
-                    {cedis_pill('444', row.get('444', 0))}
-                    {cedis_pill('831', row.get('831', 0))}
-                    {cedis_pill('811', row.get('811', 0))}
-                    {cedis_pill('834', row.get('834', 0))}
-                  </div></td>
+                  <td>
+                    <span class="status-tag {status_tone(status)}">{escape(status)}</span>
+                    {comment_html}
+                  </td>
+                  <td>
+                    <div class="cedis-grid">
+                      {cedis_cell("444", row.get("444", 0))}
+                      {cedis_cell("831", row.get("831", 0))}
+                      {cedis_cell("811", row.get("811", 0))}
+                      {cedis_cell("834", row.get("834", 0))}
+                    </div>
+                  </td>
                 </tr>
                 """
             )
-        body = "".join(rows)
+        rows_html = "".join(rows)
 
-    visible_note = (
-        f"Mostrando 100 de {len(frame):,} registros"
+    visible_text = (
+        f"Mostrando 100 de {len(frame):,}"
         if len(frame) > 100
-        else "Mostrando todos los registros"
+        else f"Mostrando {len(frame):,}"
     )
     st.markdown(
         f"""
         <section class="detail-card">
           <div class="detail-head">
-            <h2>Visibilidad CEDIS</h2>
-            <div class="result-counter">{len(frame):,} resultados</div>
+            <div>
+              <span>DETALLE OPERATIVO</span>
+              <h3>Visibilidad CEDIS</h3>
+            </div>
+            <strong>{len(frame):,} resultados</strong>
           </div>
           <div class="table-scroll">
             <table class="data-table">
-              <thead><tr>
-                <th>SKU &amp; Producto</th>
-                <th>Tienda</th>
-                <th>Inventario / Físico + Inc</th>
-                <th>Status actual</th>
-                <th>Stock orígenes / 444 · 831 · 811 · 834</th>
-              </tr></thead>
-              <tbody>{body}</tbody>
+              <thead>
+                <tr>
+                  <th>SKU / Producto</th>
+                  <th>Tienda</th>
+                  <th>Inventario</th>
+                  <th>Estado actual</th>
+                  <th>Stock origen</th>
+                </tr>
+              </thead>
+              <tbody>{rows_html}</tbody>
             </table>
           </div>
-          <div class="footer-note">
-            <span>Supply Pro // Control operativo</span>
-            <span>{visible_note}</span>
+          <div class="table-footer">
+            <span>Supply control · Golden &amp; Infaltables</span>
+            <span>{visible_text} registros</span>
           </div>
         </section>
         """,
@@ -520,69 +644,460 @@ def inject_css() -> None:
     st.markdown(
         f"""
         <style>
-          :root {{ --ink:{INK}; --paper:{PAPER}; --white:{WHITE}; --red:{RED}; --acid:{ACID}; --blue:{BLUE}; --green:{GREEN}; --muted:{MUTED}; }}
-          .stApp {{
-            background: linear-gradient(rgba(11,11,11,.045) 1px, transparent 1px),
-                        linear-gradient(90deg, rgba(11,11,11,.045) 1px, transparent 1px), var(--paper);
-            background-size: 28px 28px; color: var(--ink);
+          :root {{
+            --ink:{INK}; --paper:{PAPER}; --white:{WHITE}; --soft:{SOFT};
+            --muted:{MUTED}; --acid:{ACID}; --red:{RED}; --blue:{BLUE}; --green:{GREEN};
           }}
-          .block-container {{ max-width:1680px; padding:1rem 2.1rem 3rem; }}
+
+          .stApp {{
+            background:var(--paper);
+            color:var(--ink);
+          }}
+          .block-container {{
+            max-width:1580px;
+            padding:1.25rem 2rem 3.5rem;
+          }}
           header[data-testid="stHeader"] {{ background:transparent; }}
           #MainMenu, footer {{ visibility:hidden; }}
-          h1, h2, h3 {{ color:var(--ink); }}
-          .masthead {{ display:grid; grid-template-columns:78px 1fr auto; min-height:78px; margin:0 0 30px; background:var(--ink); color:var(--white); border:3px solid var(--ink); box-shadow:7px 7px 0 var(--ink); }}
-          .brand-mark {{ display:grid; place-items:center; background:var(--red); color:var(--ink); border-right:4px solid var(--white); font:900 31px/1 Impact, "Arial Black", sans-serif; }}
-          .brand-copy {{ display:flex; align-items:center; gap:16px; padding:13px 22px; min-width:0; }}
-          .brand-copy h1 {{ margin:0; color:var(--white); font:900 clamp(22px,2.4vw,38px)/.95 Impact,"Arial Black",sans-serif; letter-spacing:.02em; text-transform:uppercase; white-space:nowrap; }}
-          .brand-copy span {{ padding:5px 8px; background:var(--acid); color:var(--ink); border:2px solid var(--white); font-size:11px; font-weight:800; text-transform:uppercase; white-space:nowrap; }}
-          .health {{ display:flex; align-items:center; gap:10px; padding:0 25px; border-left:2px solid rgba(255,255,255,.35); font-size:12px; font-weight:800; text-transform:uppercase; white-space:nowrap; }}
-          .health i {{ width:11px; height:11px; background:var(--acid); border:2px solid var(--white); border-radius:50%; box-shadow:0 0 0 2px var(--ink); }}
-          .section-kicker {{ display:flex; align-items:center; gap:12px; margin:20px 0 14px; font-size:12px; font-weight:900; letter-spacing:.05em; text-transform:uppercase; }}
-          .section-kicker span {{ display:grid; place-items:center; width:27px; height:27px; background:var(--ink); color:var(--white); }}
-          .bento-grid {{ display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:18px; margin-bottom:30px; }}
-          .kpi-card {{ position:relative; min-height:205px; padding:19px; display:flex; flex-direction:column; justify-content:space-between; overflow:hidden; border:3px solid var(--ink); box-shadow:7px 7px 0 var(--ink); }}
-          .kpi-card::after {{ content:attr(data-code); position:absolute; right:-7px; bottom:-24px; color:rgba(11,11,11,.07); font:900 92px/1 Impact,"Arial Black",sans-serif; }}
-          .kpi-card.acid {{ background:var(--acid); }} .kpi-card.red {{ background:var(--red); }} .kpi-card.white {{ background:var(--white); }} .kpi-card.blue {{ background:var(--blue); color:var(--white); }}
-          .eyebrow {{ position:relative; z-index:1; display:flex; justify-content:space-between; gap:10px; padding-bottom:13px; border-bottom:2px solid currentColor; font-size:12px; font-weight:900; text-transform:uppercase; }}
-          .eyebrow b {{ font:900 18px Impact,"Arial Black",sans-serif; }}
-          .metric {{ position:relative; z-index:1; margin-top:18px; font:900 clamp(54px,5vw,86px)/.86 Impact,"Arial Black",sans-serif; letter-spacing:-.02em; }}
-          .metric-sub {{ position:relative; z-index:1; margin-top:14px; font-size:12px; font-weight:800; text-transform:uppercase; }}
-          .st-key-filter_panel {{ padding:16px; background:var(--ink); border:3px solid var(--ink)!important; border-radius:0!important; box-shadow:7px 7px 0 var(--ink); }}
-          .st-key-filter_panel label {{ color:var(--acid)!important; font-size:11px!important; font-weight:900!important; letter-spacing:.05em; text-transform:uppercase; }}
-          .st-key-filter_panel div[data-baseweb="input"] > div, .st-key-filter_panel div[data-baseweb="select"] > div {{ border-radius:0!important; border:2px solid var(--white)!important; background:var(--white)!important; }}
-          .analytics-card {{ min-height:300px; overflow:hidden; background:var(--white); border:3px solid var(--ink); box-shadow:7px 7px 0 var(--ink); }}
-          .card-title {{ min-height:48px; display:flex; align-items:center; justify-content:space-between; gap:10px; padding:13px 16px; background:var(--ink); color:var(--white); font-size:13px; font-weight:900; letter-spacing:.04em; text-transform:uppercase; }}
-          .card-title span {{ padding:4px 6px; background:var(--acid); color:var(--ink); font-size:10px; }}
-          .mini-table {{ width:100%; border-collapse:collapse; table-layout:fixed; font-size:13px; }}
-          .mini-table th {{ padding:11px 15px; color:var(--muted); border-bottom:2px solid var(--ink); font-size:11px; font-weight:900; letter-spacing:.05em; text-align:left; text-transform:uppercase; }}
-          .mini-table td {{ padding:10px 15px; border-bottom:1px solid var(--ink); font-weight:700; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }}
-          .mini-table .num {{ width:92px; text-align:right; }}
-          .rank {{ display:inline-grid; place-items:center; width:23px; height:23px; margin-right:7px; background:var(--ink); color:var(--white); font-size:11px; font-weight:900; }}
-          .danger-num {{ display:inline-block; min-width:37px; padding:4px 6px; background:var(--red); border:2px solid var(--ink); text-align:center; }}
-          .healthy-network {{ color:var(--green); padding:25px 15px!important; }}
-          .st-key-status_chart {{ min-height:300px; background:var(--white); border:3px solid var(--ink); box-shadow:7px 7px 0 var(--ink); }}
-          .st-key-network_chart {{ padding-bottom:10px; background:var(--white); border:3px solid var(--ink); box-shadow:7px 7px 0 var(--ink); margin-bottom:30px; }}
-          .network-head, .detail-head {{ display:flex; align-items:center; justify-content:space-between; gap:18px; padding:18px 20px; background:var(--acid); border-bottom:3px solid var(--ink); }}
-          .network-head h2, .detail-head h2 {{ margin:0; font:900 clamp(24px,3vw,43px)/.95 Impact,"Arial Black",sans-serif; text-transform:uppercase; }}
-          .result-counter {{ padding:7px 10px; background:var(--ink); color:var(--white); border:2px solid var(--ink); font-size:11px; font-weight:900; text-transform:uppercase; white-space:nowrap; }}
-          .detail-card {{ overflow:hidden; margin-bottom:30px; background:var(--white); border:3px solid var(--ink); box-shadow:7px 7px 0 var(--ink); }}
-          .table-scroll {{ max-height:590px; overflow:auto; }}
-          .data-table {{ width:100%; min-width:1000px; border-collapse:separate; border-spacing:0; font-size:14px; }}
-          .data-table th {{ position:sticky; top:0; z-index:3; padding:12px 11px; background:var(--ink); color:var(--white); border-right:1px solid #4f4f4f; font-size:11px; font-weight:900; letter-spacing:.05em; text-align:left; text-transform:uppercase; }}
-          .data-table td {{ padding:13px 11px; border-right:1px solid var(--ink); border-bottom:1px solid var(--ink); vertical-align:middle; }}
-          .data-table tbody tr:nth-child(even) {{ background:#e6e2d8; }} .data-table tbody tr:hover {{ background:#fff4ac; }}
-          .product-name {{ margin-bottom:4px; font-size:14px; font-weight:800; line-height:1.2; }}
-          .micro-copy {{ color:var(--muted); font-size:12px; line-height:1.3; }} .stock-main {{ font-size:15px; font-weight:900; }}
-          .status-tag {{ display:inline-block; max-width:250px; padding:6px 8px; border:2px solid var(--ink); box-shadow:3px 3px 0 var(--ink); font-size:10px; font-weight:900; letter-spacing:.05em; text-transform:uppercase; }}
-          .tag-red {{ background:var(--red); }} .tag-blue {{ background:var(--blue); color:var(--white); }} .tag-gray {{ background:#cfcac0; }}
-          .cedis-grid {{ display:grid; grid-template-columns:repeat(4,minmax(48px,1fr)); gap:5px; }}
-          .cedis-pill {{ padding:5px 6px; background:var(--ink); color:var(--white); border:2px solid var(--ink); font-size:11px; font-weight:900; text-align:center; }}
-          .cedis-pill span {{ color:var(--acid); }} .cedis-pill.empty {{ background:var(--white); color:var(--ink); }} .cedis-pill.empty span {{ color:var(--red); }}
-          .empty-state {{ padding:44px!important; color:var(--muted); font-size:13px; font-weight:900; text-align:center; text-transform:uppercase; }}
-          .footer-note {{ display:flex; justify-content:space-between; gap:16px; padding:12px 15px; background:var(--ink); color:var(--white); font-size:11px; font-weight:800; letter-spacing:.05em; text-transform:uppercase; }}
-          ::-webkit-scrollbar {{ width:12px; height:12px; }} ::-webkit-scrollbar-track {{ background:var(--white); }} ::-webkit-scrollbar-thumb {{ background:var(--red); border:2px solid var(--ink); }}
-          @media(max-width:1000px) {{ .bento-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }} .masthead {{ grid-template-columns:65px 1fr; }} .health {{ display:none; }} }}
-          @media(max-width:650px) {{ .block-container {{ padding:1rem .8rem 2rem; }} .bento-grid {{ grid-template-columns:1fr; }} .brand-copy span {{ display:none; }} .brand-copy h1 {{ white-space:normal; }} .footer-note {{ flex-direction:column; }} }}
+          html, body, [class*="css"] {{
+            font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Arial,sans-serif;
+          }}
+
+          .hero {{
+            display:flex;
+            align-items:flex-end;
+            justify-content:space-between;
+            gap:24px;
+            margin-bottom:28px;
+            padding:28px 30px;
+            background:var(--ink);
+            color:var(--white);
+            border:2px solid var(--ink);
+            box-shadow:5px 5px 0 var(--acid);
+          }}
+          .hero-kicker {{
+            margin-bottom:8px;
+            color:var(--acid);
+            font-size:11px;
+            font-weight:800;
+            letter-spacing:.12em;
+            text-transform:uppercase;
+          }}
+          .hero h1 {{
+            margin:0;
+            color:var(--white);
+            font-size:clamp(32px,4vw,58px);
+            font-weight:850;
+            line-height:.98;
+            letter-spacing:-.04em;
+          }}
+          .hero p {{
+            margin:11px 0 0;
+            color:#D8D6D0;
+            font-size:14px;
+          }}
+          .live-badge {{
+            display:flex;
+            align-items:center;
+            gap:8px;
+            padding:9px 12px;
+            border:1px solid #565656;
+            font-size:11px;
+            font-weight:800;
+            letter-spacing:.08em;
+            white-space:nowrap;
+          }}
+          .live-badge i {{
+            width:8px;
+            height:8px;
+            background:var(--acid);
+            border-radius:50%;
+          }}
+
+          .section-heading {{
+            display:flex;
+            align-items:flex-start;
+            gap:13px;
+            margin:30px 0 14px;
+          }}
+          .section-heading > span {{
+            margin-top:2px;
+            padding:5px 7px;
+            background:var(--ink);
+            color:var(--white);
+            font-size:10px;
+            font-weight:800;
+            letter-spacing:.08em;
+          }}
+          .section-heading h2 {{
+            margin:0;
+            color:var(--ink);
+            font-size:22px;
+            font-weight:850;
+            letter-spacing:-.02em;
+          }}
+          .section-description {{
+            margin:4px 0 0;
+            color:var(--muted);
+            font-size:12px;
+          }}
+
+          .st-key-filter_panel {{
+            padding:16px 17px 13px;
+            background:var(--white);
+            border:2px solid var(--ink);
+            border-radius:0;
+            box-shadow:4px 4px 0 var(--ink);
+          }}
+          .st-key-filter_panel label {{
+            color:var(--ink)!important;
+            font-size:11px!important;
+            font-weight:800!important;
+            letter-spacing:.04em;
+            text-transform:uppercase;
+          }}
+          .st-key-filter_panel div[data-baseweb="input"] > div,
+          .st-key-filter_panel div[data-baseweb="select"] > div {{
+            min-height:43px;
+            background:#FAF9F6!important;
+            border:1.5px solid var(--ink)!important;
+            border-radius:0!important;
+            box-shadow:none!important;
+          }}
+
+          .kpi-grid {{
+            display:grid;
+            grid-template-columns:repeat(4,minmax(0,1fr));
+            gap:16px;
+            margin-bottom:8px;
+          }}
+          .kpi-card {{
+            position:relative;
+            min-height:158px;
+            padding:18px 19px;
+            overflow:hidden;
+            background:var(--white);
+            border:2px solid var(--ink);
+            box-shadow:4px 4px 0 var(--ink);
+          }}
+          .kpi-card::before {{
+            content:"";
+            position:absolute;
+            inset:0 auto 0 0;
+            width:7px;
+            background:var(--ink);
+          }}
+          .kpi-card.green::before {{ background:var(--green); }}
+          .kpi-card.red::before {{ background:var(--red); }}
+          .kpi-card.blue::before {{ background:var(--blue); }}
+          .kpi-label {{
+            color:var(--muted);
+            font-size:11px;
+            font-weight:850;
+            letter-spacing:.07em;
+            text-transform:uppercase;
+          }}
+          .kpi-value {{
+            margin:14px 0 10px;
+            color:var(--ink);
+            font-size:clamp(38px,4vw,58px);
+            font-weight:900;
+            line-height:.9;
+            letter-spacing:-.045em;
+          }}
+          .kpi-detail {{
+            color:var(--muted);
+            font-size:12px;
+            line-height:1.35;
+          }}
+
+          .ranking-card,
+          .st-key-status_card,
+          .st-key-network_card {{
+            background:var(--white);
+            border:2px solid var(--ink);
+            border-radius:0;
+            box-shadow:4px 4px 0 var(--ink);
+          }}
+          .ranking-card,
+          .st-key-status_card {{
+            min-height:344px;
+          }}
+          .card-head {{
+            min-height:54px;
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:12px;
+            padding:13px 15px;
+            border-bottom:2px solid var(--ink);
+          }}
+          .card-head h3 {{
+            margin:0;
+            color:var(--ink);
+            font-size:13px;
+            font-weight:850;
+            letter-spacing:.01em;
+          }}
+          .card-head span {{
+            padding:5px 7px;
+            background:var(--acid);
+            border:1px solid var(--ink);
+            font-size:9px;
+            font-weight:850;
+            letter-spacing:.05em;
+            text-transform:uppercase;
+          }}
+          .ranking-body {{ padding:5px 15px 10px; }}
+          .rank-row {{
+            display:grid;
+            grid-template-columns:30px minmax(0,1fr) auto;
+            align-items:center;
+            gap:9px;
+            min-height:52px;
+            border-bottom:1px solid #DCD9D1;
+          }}
+          .rank-row:last-child {{ border-bottom:0; }}
+          .rank-number {{
+            display:grid;
+            place-items:center;
+            width:25px;
+            height:25px;
+            background:var(--ink);
+            color:var(--white);
+            font-size:10px;
+            font-weight:850;
+          }}
+          .rank-name {{
+            overflow:hidden;
+            color:var(--ink);
+            font-size:12px;
+            font-weight:700;
+            text-overflow:ellipsis;
+            white-space:nowrap;
+          }}
+          .rank-row strong {{
+            min-width:38px;
+            padding:5px 7px;
+            background:#FFE7E4;
+            border:1px solid var(--red);
+            color:var(--ink);
+            font-size:12px;
+            text-align:center;
+          }}
+          .healthy-state {{
+            padding:35px 0;
+            color:var(--green);
+            font-size:12px;
+            font-weight:800;
+          }}
+          .st-key-status_card .stPlotlyChart {{
+            padding:0 6px 8px;
+          }}
+
+          .st-key-network_card {{
+            padding-bottom:8px;
+          }}
+          .network-head {{
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:16px;
+            padding:16px 18px;
+            border-bottom:2px solid var(--ink);
+          }}
+          .network-head h3 {{
+            margin:0;
+            color:var(--ink);
+            font-size:17px;
+            font-weight:850;
+          }}
+          .network-head span {{
+            color:var(--muted);
+            font-size:11px;
+            text-align:right;
+          }}
+
+          .detail-card {{
+            overflow:hidden;
+            background:var(--white);
+            border:2px solid var(--ink);
+            box-shadow:4px 4px 0 var(--ink);
+          }}
+          .detail-head {{
+            display:flex;
+            align-items:center;
+            justify-content:space-between;
+            gap:16px;
+            padding:15px 18px;
+            border-bottom:2px solid var(--ink);
+          }}
+          .detail-head span {{
+            color:var(--muted);
+            font-size:9px;
+            font-weight:850;
+            letter-spacing:.09em;
+          }}
+          .detail-head h3 {{
+            margin:3px 0 0;
+            color:var(--ink);
+            font-size:20px;
+            font-weight:850;
+          }}
+          .detail-head > strong {{
+            padding:7px 9px;
+            background:var(--ink);
+            color:var(--white);
+            font-size:10px;
+            letter-spacing:.04em;
+            text-transform:uppercase;
+          }}
+          .table-scroll {{
+            max-height:620px;
+            overflow:auto;
+          }}
+          .data-table {{
+            width:100%;
+            min-width:1050px;
+            border-collapse:separate;
+            border-spacing:0;
+            font-size:12px;
+          }}
+          .data-table th {{
+            position:sticky;
+            top:0;
+            z-index:2;
+            padding:11px 12px;
+            background:#EEECE6;
+            color:var(--ink);
+            border-right:1px solid #D4D1CA;
+            border-bottom:1.5px solid var(--ink);
+            font-size:10px;
+            font-weight:850;
+            letter-spacing:.055em;
+            text-align:left;
+            text-transform:uppercase;
+          }}
+          .data-table td {{
+            padding:11px 12px;
+            border-right:1px solid #E2DFD8;
+            border-bottom:1px solid #E2DFD8;
+            vertical-align:middle;
+          }}
+          .data-table tbody tr:nth-child(even) {{ background:#FAF9F6; }}
+          .data-table tbody tr:hover {{ background:#F3F7D9; }}
+          .table-primary {{
+            max-width:330px;
+            color:var(--ink);
+            font-size:12px;
+            font-weight:750;
+            line-height:1.25;
+          }}
+          .table-muted {{
+            max-width:260px;
+            margin-top:4px;
+            color:var(--muted);
+            font-size:10px;
+            line-height:1.3;
+          }}
+          .inventory-line strong {{
+            font-size:15px;
+            font-weight:900;
+          }}
+          .status-tag {{
+            display:inline-block;
+            max-width:250px;
+            padding:5px 7px;
+            border:1px solid var(--ink);
+            color:var(--ink);
+            font-size:9px;
+            font-weight:850;
+            line-height:1.2;
+            text-transform:uppercase;
+          }}
+          .status-tag.red {{ background:#FFE2DF; border-color:var(--red); }}
+          .status-tag.blue {{ background:#E8ECFF; border-color:var(--blue); }}
+          .status-tag.green {{ background:#DFF5E9; border-color:var(--green); }}
+          .status-tag.gray {{ background:#EEECE7; border-color:#AAA69E; }}
+          .cedis-grid {{
+            display:grid;
+            grid-template-columns:repeat(4,minmax(46px,1fr));
+            gap:5px;
+          }}
+          .cedis-cell {{
+            min-width:48px;
+            padding:5px 6px;
+            border:1px solid var(--ink);
+            text-align:center;
+          }}
+          .cedis-cell small {{
+            display:block;
+            margin-bottom:2px;
+            font-size:8px;
+            font-weight:800;
+          }}
+          .cedis-cell strong {{
+            display:block;
+            font-size:11px;
+          }}
+          .cedis-cell.positive {{
+            background:var(--ink);
+            color:var(--white);
+          }}
+          .cedis-cell.empty {{
+            background:var(--white);
+            color:#99968F;
+            border-color:#C8C5BE;
+          }}
+          .empty-table {{
+            padding:42px!important;
+            color:var(--muted);
+            font-weight:700;
+            text-align:center;
+          }}
+          .table-footer {{
+            display:flex;
+            justify-content:space-between;
+            gap:12px;
+            padding:10px 13px;
+            background:var(--ink);
+            color:#D7D4CD;
+            font-size:9px;
+            font-weight:700;
+            letter-spacing:.05em;
+            text-transform:uppercase;
+          }}
+
+          div.stDownloadButton > button,
+          div.stButton > button {{
+            border:1.5px solid var(--ink);
+            border-radius:0;
+            background:var(--white);
+            color:var(--ink);
+            font-size:11px;
+            font-weight:800;
+            box-shadow:3px 3px 0 var(--ink);
+          }}
+          div.stDownloadButton > button:hover,
+          div.stButton > button:hover {{
+            border-color:var(--ink);
+            background:var(--acid);
+            color:var(--ink);
+          }}
+          ::-webkit-scrollbar {{ width:10px; height:10px; }}
+          ::-webkit-scrollbar-track {{ background:#ECE9E2; }}
+          ::-webkit-scrollbar-thumb {{ background:#A8A49C; border:2px solid #ECE9E2; }}
+
+          @media(max-width:1050px) {{
+            .kpi-grid {{ grid-template-columns:repeat(2,minmax(0,1fr)); }}
+          }}
+          @media(max-width:700px) {{
+            .block-container {{ padding:1rem .8rem 2.5rem; }}
+            .hero {{ align-items:flex-start; flex-direction:column; padding:22px 20px; }}
+            .hero h1 {{ font-size:36px; }}
+            .kpi-grid {{ grid-template-columns:1fr; }}
+            .table-footer {{ flex-direction:column; }}
+          }}
         </style>
         """,
         unsafe_allow_html=True,
@@ -593,126 +1108,149 @@ def main() -> None:
     inject_css()
     render_header()
 
-    configured_url = get_setting("SHEET_URL")
-    sheet_name = get_setting("SHEET_NAME", "BASE") or "BASE"
-    header_row = max(get_int_setting("HEADER_ROW", 2), 1)
-    max_rows = max(get_int_setting("MAX_DATA_ROWS", 15000), 1)
-
-    if not configured_url:
-        st.warning("Falta conectar el origen de datos.")
-        configured_url = st.text_input(
-            "URL o ID del Google Sheet público",
-            placeholder="https://docs.google.com/spreadsheets/d/...",
-            help="Para el despliegue permanente, configura SHEET_URL en los Secrets de Streamlit.",
-        )
-        if not configured_url:
-            st.stop()
-
     with st.sidebar:
-        st.markdown("### Origen de datos")
-        st.caption(f"Pestaña: {sheet_name} · Encabezados: fila {header_row}")
+        st.markdown("### Fuente de datos")
+        st.caption("GOLDEN / INFALTABLES TRACKER SKUS")
+        st.caption("Pestaña: BASE · Cabeceras: fila 2")
         if st.button("Actualizar datos", use_container_width=True):
-            load_sheet.clear()
+            load_data.clear()
             st.rerun()
 
     try:
-        with st.spinner("Inicializando motor analítico..."):
-            raw_data, metadata = load_sheet(
-                configured_url, sheet_name, header_row, max_rows
-            )
+        with st.spinner("Conectando con BASE y preparando el dashboard..."):
+            raw_data, metadata = load_data()
     except Exception as exc:
-        st.error(f"No fue posible cargar el Google Sheet: {exc}")
+        st.error("No fue posible cargar la hoja BASE.")
+        st.code(str(exc))
         st.info(
-            "Confirma que el archivo esté compartido como “Cualquier persona con el enlace: Lector” "
-            f"y que la pestaña se llame “{sheet_name}”."
+            "Verifica que el archivo continúe habilitado para lectura pública. "
+            "El dashboard ya contiene el ID, la pestaña y la fila de cabeceras correctos."
         )
         st.stop()
 
-    if metadata["truncated"]:
-        st.warning(
-            f"La fuente supera el límite de {metadata['max_rows']:,} filas; "
-            "el dashboard cargó únicamente ese máximo."
+    section_title(
+        "FILTROS",
+        "Enfoque operativo",
+        "Los indicadores y visualizaciones responden a esta selección.",
+    )
+    with st.container(key="filter_panel"):
+        search_col, city_col, store_col, segment_col = st.columns(
+            [1.8, 1, 1.2, 1]
         )
-
-    section_kicker("01", "Visión macro / disponibilidad")
-    kpi_slot = st.empty()
-
-    section_kicker("02", "Funnel de filtrado")
-    with st.container(border=True, key="filter_panel"):
-        search_col, city_col, store_col, segment_col = st.columns([2, 1, 1, 1])
         with search_col:
             search = st.text_input(
-                "Búsqueda quirúrgica / SKU o nombre",
-                placeholder="Escribe un producto o SKU...",
+                "SKU o producto",
+                placeholder="Buscar por nombre o código...",
             )
         with city_col:
-            city = st.selectbox("Ciudad", ["Todas", *unique_options(raw_data, "CITY")])
+            city = st.selectbox(
+                "Ciudad",
+                ["Todas", *unique_options(raw_data, "CITY")],
+            )
+
+        store_source = (
+            raw_data
+            if city == "Todas"
+            else raw_data.loc[text_series(raw_data, "CITY").eq(city)]
+        )
         with store_col:
             store = st.selectbox(
                 "Tienda / Warehouse",
-                ["Todas", *unique_options(raw_data, "WAREHOUSE_NAME")],
+                ["Todas", *unique_options(store_source, "WAREHOUSE_NAME")],
             )
         with segment_col:
             segment = st.selectbox(
-                "Segmento / IGA", ["Todos", *unique_options(raw_data, "IGA")]
+                "Segmento / IGA",
+                ["Todos", *unique_options(raw_data, "IGA")],
             )
 
     filtered = apply_filters(raw_data, search, city, store, segment)
-    with kpi_slot.container():
-        render_kpis(filtered)
 
-    section_kicker("03", "Inteligencia de negocio / ofensores")
-    top_store_col, top_sku_col, donut_col = st.columns([1, 1, 0.82], gap="large")
-    with top_store_col:
-        render_top_table(
-            "Top 5 / Tiendas con quiebres",
+    section_title(
+        "RESUMEN",
+        "Disponibilidad de la red",
+        "Lectura ejecutiva del universo filtrado.",
+    )
+    render_kpis(filtered)
+
+    section_title(
+        "RIESGO",
+        "Principales ofensores",
+        "Tiendas, productos y estados que concentran los quiebres.",
+    )
+    stores_col, products_col, status_col = st.columns([1, 1, 0.95], gap="large")
+    with stores_col:
+        render_ranking_card(
+            "Tiendas con más quiebres",
             "Warehouse",
-            "Tienda",
             top_counts(filtered, "WAREHOUSE_NAME"),
         )
-    with top_sku_col:
-        render_top_table(
-            "Top 5 / SKUs quebrados",
-            "Global",
-            "Producto",
+    with products_col:
+        render_ranking_card(
+            "Productos más quebrados",
+            "SKU",
             top_counts(filtered, "PRODUCT_NAME"),
         )
-    with donut_col, st.container(key="status_chart"):
+    with status_col, st.container(key="status_card"):
         st.markdown(
-            '<div class="card-title">Composición del estatus<span>Mix</span></div>',
+            '<div class="card-head"><h3>Composición del estatus</h3><span>Mix</span></div>',
             unsafe_allow_html=True,
         )
         st.plotly_chart(
-            donut_figure(filtered),
+            status_figure(filtered),
             use_container_width=True,
             config={"displayModeBar": False, "responsive": True},
         )
 
-    section_kicker("04", "Desempeño / AVL por Tienda")
-    store_figure = store_availability_figure(filtered, city)
-    with st.container(key="network_chart"):
+    section_title(
+        "RED",
+        "AVL por tienda",
+        "Se priorizan las tiendas con menor disponibilidad para mantener la gráfica legible.",
+    )
+    network_figure, network_note = store_figure(filtered, city)
+    with st.container(key="network_card"):
         st.markdown(
-            """
-            <div class="network-head"><h2>Rendimiento de Red</h2><div class="result-counter">AVL % por Tienda</div></div>
+            f"""
+            <div class="network-head">
+              <h3>Rendimiento de tiendas</h3>
+              <span>{html.escape(network_note)}</span>
+            </div>
             """,
             unsafe_allow_html=True,
         )
-        if store_figure is None:
+        if network_figure is None:
             st.info("Sin tiendas para mostrar con los filtros actuales.")
         else:
             st.plotly_chart(
-                store_figure,
+                network_figure,
                 use_container_width=True,
                 config={"displayModeBar": False, "responsive": True},
             )
 
-    section_kicker("05", "Ejecución / detalle operativo")
+    section_title(
+        "EJECUCIÓN",
+        "Detalle operativo",
+        "Inventario de tienda, incoming y disponibilidad en CEDIS.",
+    )
+    action_left, action_right = st.columns([5, 1])
+    with action_right:
+        st.download_button(
+            "Descargar vista CSV",
+            data=filtered.to_csv(index=False).encode("utf-8-sig"),
+            file_name="golden_infaltables_filtrado.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     render_detail_table(filtered)
 
-    loaded_at = str(metadata["loaded_at"]).replace("T", " ").replace("+00:00", " UTC")
+    loaded_at = (
+        str(metadata["loaded_at"])
+        .replace("T", " ")
+        .replace("+00:00", " UTC")
+    )
     st.caption(
-        f"Fuente: {metadata['sheet_name']} · {metadata['rows']:,} filas cargadas · "
-        f"Última lectura: {loaded_at} · caché de 5 minutos"
+        f"BASE · {metadata['rows']:,} registros cargados · "
+        f"Lectura: {loaded_at} · Caché: 5 minutos"
     )
 
 
